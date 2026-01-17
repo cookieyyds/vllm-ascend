@@ -1273,6 +1273,66 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y,expert_idx,out);
 }
 
+at::Tensor npu_lightning_indexer_quant(
+    const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
+    const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key,
+    const c10::optional<at::Tensor> &block_table, int64_t query_quant_mode, int64_t key_quant_mode,
+    c10::string_view layout_query, c10::string_view layout_key, int64_t sparse_count, int64_t sparse_mode)
+{
+    std::string query_layout_str = std::string(layout_query);
+    std::string key_layout_str = std::string(layout_key);
+
+    const int SIZE = 8;
+    const int DIM_0 = 0;
+    const int DIM_1 = 1;
+    const int DIM_2 = 2;
+    const int DIM_3 = 3;
+
+    at::SmallVector<int64_t, SIZE> output_size;
+    for (size_t i = 0; i < query.sizes().size(); i++) {
+        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
+            "than 0, but shape[", i, "] is ", query.size(i));
+    }
+    for (size_t i = 0; i < key.sizes().size(); i++) {
+        TORCH_CHECK(key.size(i) > 0, "All values within key's shape should be greater "
+            "than 0, but shape[", i, "] is ", key.size(i));
+    }
+    TORCH_CHECK(sparse_count > 0, "sparse count should be greater than 0, but now is ", sparse_count);
+    int64_t keyHeadNum = (key_layout_str == "TND")? key.size(DIM_1) : key.size(DIM_2);
+    if (query_layout_str == "BSND") {
+        output_size = {query.size(DIM_0), query.size(DIM_1), keyHeadNum, sparse_count};
+    } else {
+        output_size = {query.size(DIM_0), keyHeadNum, sparse_count};
+    }
+    at::Tensor lightning_indexer_quant_output = at::empty(output_size, query.options().dtype(at::kInt));
+
+    // convert str
+    char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
+    char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
+
+    EXEC_NPU_CMD_V1(aclnnLightningIndexerQuant, 
+                    query,
+                    key, 
+                    weights, 
+                    query_dequant_scale, 
+                    key_dequant_scale, 
+                    actual_seq_lengths_query, 
+                    actual_seq_lengths_key,
+                    block_table, 
+                    query_quant_mode, 
+                    key_quant_mode, 
+                    query_layout_ptr, 
+                    key_layout_ptr, 
+                    sparse_count, 
+                    sparse_mode,
+                    lightning_indexer_quant_output
+                );
+
+    return lightning_indexer_quant_output;
+}
+
 } // namespace vllm_ascend
 
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
@@ -1438,4 +1498,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor y ,Tensor expert_idx, Tensor out)"
         );
     ops.impl("moe_gating_top_k", torch::kPrivateUse1,&vllm_ascend::moe_gating_top_k);
+
+    ops.def(
+        "npu_lightning_indexer_quant(Tensor query, Tensor key, Tensor weights, Tensor query_dequant_scale, "
+        "                            Tensor key_dequant_scale, *, Tensor? actual_seq_lengths_query=None, "
+        "                            Tensor? actual_seq_lengths_key=None, Tensor? block_table=None, "
+        "                            int query_quant_mode=0, int key_quant_mode=0, "
+        "                            str layout_query='BSND', str layout_key='BSND',"
+        "                            int sparse_count=2048, int sparse_mode=3) -> Tensor"
+    );
+    ops.impl("npu_lightning_indexer_quant", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer_quant);
 }
