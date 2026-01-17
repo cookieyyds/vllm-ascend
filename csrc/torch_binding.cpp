@@ -1312,7 +1312,7 @@ at::Tensor npu_lightning_indexer_quant(
     char *query_layout_ptr = const_cast<char *>(query_layout_str.c_str());
     char *key_layout_ptr = const_cast<char *>(key_layout_str.c_str());
 
-    EXEC_NPU_CMD_V1(aclnnLightningIndexerQuant, 
+    EXEC_NPU_CMD(aclnnLightningIndexerQuant, 
                     query,
                     key, 
                     weights, 
