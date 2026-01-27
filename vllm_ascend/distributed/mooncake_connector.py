@@ -329,6 +329,7 @@ class KVCacheRecvingThread(threading.Thread):
         # TODO(jianzs): find a better way to detect MLA.
         self.use_mla = len(block_len) == 2
         self.use_sparse = len(block_len) == 3
+        self.use_quant_sparse = len(block_len) == 4
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
@@ -536,6 +537,8 @@ class KVCacheRecvingThread(threading.Thread):
                 block_len = (self.block_len[k % 2])
             elif self.use_sparse:
                 block_len = (self.block_len[k % 3])
+            elif self.use_quant_sparse:
+                block_len = (self.block_len[k % 4])
             else:
                 block_len = (self.block_len[0])
             inner_block_len = block_len // tp_num_need_pulls
@@ -1209,6 +1212,7 @@ class MooncakeConnectorWorker:
             -1) != first_kv_cache_tuple[1].size(-1) and len(
                 first_kv_cache_tuple) == 2
         self.use_sparse = len(first_kv_cache_tuple) == 3
+        self.use_quant_sparse = len(first_kv_cache_tuple) == 4
         if self.use_mla:
             # MLA case.[num_block, block_size, 1, hidden_dim]
             self.num_blocks = first_kv_cache.shape[0]
@@ -1237,6 +1241,23 @@ class MooncakeConnectorWorker:
                 "num_blocks: %s, block_shape_norm: %s, block_shape_pe: %s, block_shape_k: %s",
                 self.num_blocks, block_shape_norm, block_shape_pe,
                 block_shape_k)
+        elif self.use_quant_sparse:
+            self.num_blocks = first_kv_cache.shape[0]
+            block_rank = 3  # [block_size, latent_dim]
+            block_shape_norm = first_kv_cache_tuple[0].shape[-block_rank:]
+            block_shape_pe = first_kv_cache_tuple[1].shape[-block_rank:]
+            block_shape_k = first_kv_cache_tuple[2].shape[-block_rank:]
+            block_shape_scale = first_kv_cache_tuple[3].shape[-block_rank+1:]
+            self.block_len = [
+                first_kv_cache[0].element_size() * math.prod(block_shape_norm),
+                first_kv_cache[1].element_size() * math.prod(block_shape_pe),
+                first_kv_cache[2].element_size() * math.prod(block_shape_k),
+                first_kv_cache[3].element_size() * math.prod(block_shape_scale)
+            ]
+            logger.info(
+                "num_blocks: %s, block_shape_norm: %s, block_shape_pe: %s, block_shape_k: %s, block_shape_scale: %s",
+                self.num_blocks, block_shape_norm, block_shape_pe,
+                block_shape_k, block_shape_scale)
         else:
             # eager:[num_block, block_size, num_head, hidden_dim]
             # torchair:[num_block, block_size, num_head*hidden_dim]
@@ -1270,6 +1291,13 @@ class MooncakeConnectorWorker:
                 for i, cache in enumerate(cache_or_caches, 0):
                     base_addr = cache.data_ptr()
                     region_len = self.num_blocks * self.block_len[i % 3]
+                    kv_caches_base_addr.append(base_addr)
+                    ptrs.append(base_addr)
+                    lengths.append(region_len)
+            elif self.use_quant_sparse:
+                for i, cache in enumerate(cache_or_caches, 0):
+                    base_addr = cache.data_ptr()
+                    region_len = self.num_blocks * self.block_len[i % 4]
                     kv_caches_base_addr.append(base_addr)
                     ptrs.append(base_addr)
                     lengths.append(region_len)
@@ -1666,7 +1694,8 @@ class MooncakeConnectorWorker:
                              num_groups: int) -> List[List[int]]:
         # random split prefill tp list
         tp_sampled_nums = []
-        if self._prefill_tp_size > self.num_key_value_heads or self.vllm_config.model_config.is_deepseek_mla or self.use_sparse:
+        if self._prefill_tp_size > self.num_key_value_heads or self.vllm_config.model_config.is_deepseek_mla \
+            or self.use_sparse or self.use_quant_sparse:
             tp_ori_data = tp_ori_data.reshape(-1, num_groups)
             choosen_group = tp_ori_data[:, [rand_group_index]]
             flattened = choosen_group.reshape(-1).tolist()
@@ -1694,7 +1723,7 @@ class MooncakeConnectorWorker:
                     ], range(self._prefill_tp_size)))
             return sampled_nums
         # use deepseek mla, num_key_value_heads == 128, but consider as 1
-        if self.vllm_config.model_config.is_deepseek_mla or self.use_sparse:
+        if self.vllm_config.model_config.is_deepseek_mla or self.use_sparse or self.use_quant_sparse:
             num_kv_head = 1
         else:
             num_kv_head = self.num_key_value_heads
