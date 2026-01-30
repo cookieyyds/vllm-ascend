@@ -37,8 +37,9 @@ from vllm_ascend.ops.weight_prefetch import maybe_npu_prefetch
 from vllm_ascend.quantization.w8a8 import AscendW8A8LinearMethod
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, _round_up, dispose_layer,
                                enable_dsa_cp, enable_dsa_cp_with_layer_shard,
-                               maybe_trans_nz)
+                               maybe_trans_nz, AscendDeviceType, get_ascend_device_type)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+import scipy
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -344,6 +345,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.enable_c8_indexer = True
+        self.qk_hadamard = torch.tensor(scipy.linalg.hadamard(128),dtype=torch.bfloat16, device='npu') / (128 ** 0.5)
 
         # MLA Args
         self.q_lora_rank = kwargs['q_lora_rank']
@@ -768,7 +771,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 need_gather_q_kv=need_gather_q_kv,
                 num_input_tokens=num_input_tokens,
             )
-            q, k = self.indexer_select_pre_process(
+            q, k, k_scale = self.indexer_select_pre_process(
                 x=hidden_states,
                 qr=q_c,
                 cos=cos,
@@ -792,7 +795,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_no_split = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     kv_no_split.contiguous(), need_gather_q_kv)
 
-            q, k = self.indexer_select_pre_process(
+            q, k, k_scale = self.indexer_select_pre_process(
                 x=hidden_states,
                 qr=q_c,
                 cos=cos,
@@ -815,15 +818,33 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_pe is not None
                 assert k_nope is not None
                 # support all_gather kv async for communication calculation overlap
-                fused_kv_no_split, kv_ag_handle = all_gather_async(
-                    torch.cat([
-                        k_pe.view(-1, k_pe.shape[-1]),
-                        k_nope.view(-1, k_nope.shape[-1]),
-                        k.view(-1, k.shape[-1])
-                    ],
-                              dim=1),
-                    get_tp_group(),
-                    async_op=should_shard_weight)
+                if self.enable_c8_indexer:
+                    fused_kv_no_split, _ = all_gather_async(
+                        torch.cat([
+                            k_pe.view(-1, k_pe.shape[-1]),
+                            k_nope.view(-1, k_nope.shape[-1])
+                        ],
+                                dim=1),
+                        get_tp_group(),
+                        async_op=should_shard_weight)
+                    k, _ = all_gather_async(
+                        k,
+                        get_tp_group(),
+                        async_op=should_shard_weight)
+                    k_scale, kv_ag_handle = all_gather_async(
+                        k_scale,
+                        get_tp_group(),
+                        async_op=should_shard_weight)
+                else:
+                    fused_kv_no_split, kv_ag_handle = all_gather_async(
+                        torch.cat([
+                            k_pe.view(-1, k_pe.shape[-1]),
+                            k_nope.view(-1, k_nope.shape[-1]),
+                            k.view(-1, k.shape[-1])
+                        ],
+                                dim=1),
+                        get_tp_group(),
+                        async_op=should_shard_weight)
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
@@ -844,10 +865,16 @@ class AscendSFAImpl(MLAAttentionImpl):
 
                 if kv_cache is not None:
                     assert fused_kv_no_split is not None
-                    k_pe, k_nope, k = fused_kv_no_split.split([
-                        self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim
-                    ],
-                                                              dim=-1)
+                    if self.enable_c8_indexer:
+                        k_pe, k_nope = fused_kv_no_split.split([
+                            self.qk_rope_head_dim, self.kv_lora_rank
+                        ],
+                                                                dim=-1)
+                    else:
+                        k_pe, k_nope, k = fused_kv_no_split.split([
+                            self.qk_rope_head_dim, self.kv_lora_rank, self.head_dim
+                        ],
+                                                                dim=-1)
                     slot_mapping = attn_metadata.slot_mapping.view(-1, 1)
                     torch_npu.npu_scatter_nd_update_(
                         kv_cache[0].view(-1, k_nope.shape[-1]), slot_mapping,
@@ -873,7 +900,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             sin=sin,
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
-            need_gather_q_kv=need_gather_q_kv)
+            need_gather_q_kv=need_gather_q_kv,
+            k_scale=k_scale
+            )
 
         attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
             query=ql_nope,
@@ -943,6 +972,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                                        sin,
                                        rope_dim=self.qk_rope_head_dim,
                                        is_neox_style=True)
+            if self.enable_c8_indexer:
+                soc_version = get_ascend_device_type()
+                dst_type = torch.float8_e4m3fn if soc_version in \
+                {AscendDeviceType.A5} else torch.int8
+                k = k @ self.qk_hadamard
+                k, k_scale = torch_npu.npu_dynamic_quant(k.view(-1, self.head_dim), dst_type=dst_type)
+                if soc_version not in {AscendDeviceType.A5}:
+                    k_scale = k_scale.to(torch.float16)
         else:
             k_pe, k_nope = torch.split(
                 k,
@@ -958,8 +995,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             k = torch.cat([k_pe, k_nope], dim=-1)  # [b*s,128]
             q = None
+            k_scale = None
 
-        return q, k
+        return q, k, k_scale
 
     def indexer_select_post_process(
         self,
@@ -973,6 +1011,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        k_scale: Optional[torch.Tensor],
         need_gather_q_kv: bool = False,
     ):
         if q is None:
@@ -989,6 +1028,16 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q)
             q_pe = q_pe.squeeze(2)
             q = torch.cat([q_pe, q_nope], dim=-1)  # [b*s,64,128]
+        
+        if self.enable_c8_indexer:
+            soc_version = get_ascend_device_type()
+            dst_type = torch.float8_e4m3fn if soc_version in \
+            {AscendDeviceType.A5} else torch.int8
+            q_shape = q.shape
+            q = q @ self.qk_hadamard
+            q, q_scale = torch_npu.npu_dynamic_quant(q.view(-1, self.head_dim), dst_type=dst_type)
+            if soc_version not in {AscendDeviceType.A5}:
+                q_scale = q_scale.to(torch.float16)
 
         if kv_cache is not None:
             if self.is_kv_producer:
@@ -998,6 +1047,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                                                  -1, 1),
                                              k.view(-1,
                                                     k.shape[-1]))  # b, s, n, d
+            
+            if self.enable_c8_indexer:
+                torch_npu.npu_scatter_nd_update_(kv_cache[3].view(-1, 1),
+                                                attn_metadata.slot_mapping.view(
+                                                    -1, 1),
+                                                k_scale.view(-1,
+                                                    1))
+
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
@@ -1007,17 +1064,35 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         block_table = attn_metadata.block_tables
 
-        topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
-            query=q,
-            key=kv_cache[2],
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=2048,
-            sparse_mode=3)
+        if self.enable_c8_indexer:
+            weights = weights.to(torch.float16)
+            topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
+                query=q.view(q_shape),
+                key=kv_cache[2],
+                weights=weights,
+                query_dequant_scale=q_scale.view(q_shape[:-1]),
+                key_dequant_scale=kv_cache[3],
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                query_quant_mode=0,
+                key_quant_mode=0,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=2048,
+                sparse_mode=3)
+        else:
+            topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
+                query=q,
+                key=kv_cache[2],
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_query,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=2048,
+                sparse_mode=3)
         return topk_indices
 
     def _init_o_proj_tp_full_params(self):

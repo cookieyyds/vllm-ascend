@@ -262,6 +262,7 @@ class NPUModelRunner(GPUModelRunner):
         # Set up Attention
         self.use_sparse = hasattr(self.vllm_config.model_config.hf_text_config,
                                   "index_topk")
+        self.use_sparse_c8_inderex = True
         self.attn_backend = get_attn_backend(
             0,
             self.dtype,
@@ -2526,8 +2527,14 @@ class NPUModelRunner(GPUModelRunner):
                         dsa_k_cache_factor = 2
                         k_tensor_split_factor = 2 * head_size / self.model_config.hf_text_config.kv_lora_rank
                         v_tensor_split_factor = 2 * head_size / self.model_config.hf_text_config.qk_rope_head_dim
-                        dsa_k_cache_size = int(kv_cache_tensor.size //
-                                               dsa_k_cache_factor)
+                        # dsa_k_cache_size = int(kv_cache_tensor.size //
+                        #                        dsa_k_cache_factor)
+                        if self.use_sparse_c8_inderex:
+                            dsa_k_scale_cache_size = int((kv_cache_tensor.size // dsa_k_cache_factor) // 129)
+                        else:
+                            dsa_k_scale_cache_size = 0
+                        dsa_k_cache_size = int((
+                            kv_cache_tensor.size // dsa_k_cache_factor) - dsa_k_scale_cache_size)
                     else:
                         # for other deepseek models, use MLAAttentionSpec
                         k_tensor_split_factor = head_size / self.model_config.hf_text_config.kv_lora_rank
@@ -2552,6 +2559,11 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_cache_size,
                                 dtype=torch.int8,
                                 device=self.device)
+                            if self.use_sparse_c8_inderex:
+                                dsa_k_scale_cache_tensor = torch.zeros(
+                                    dsa_k_scale_cache_size,
+                                    dtype=torch.int8,
+                                    device=self.device)
                     else:
                         k_tensor = torch.zeros(k_tensor_size + alignment,
                                                dtype=torch.int8,
@@ -2573,12 +2585,27 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_cache_tensor,
                                 alignment)[:dsa_k_cache_size]
 
+                            if self.use_sparse_c8_inderex:
+                                dsa_k_scale_cache_tensor = torch.zeros(
+                                    dsa_k_scale_cache_size + alignment,
+                                    dtype=torch.int8,
+                                    device=self.device)
+                                dsa_k_scale_cache_tensor = self._align_memory(
+                                    dsa_k_scale_cache_tensor,
+                                    alignment)[:dsa_k_scale_cache_size]
+
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if ("attn" in layer_name_inner
                                 and "linear_attn" not in layer_name_inner):
-                            kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor) if \
-                                not self.use_sparse else (k_tensor, v_tensor, dsa_k_cache_tensor)
+                            # kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor) if \
+                            #     not self.use_sparse else (k_tensor, v_tensor, dsa_k_cache_tensor)
+                            if self.use_sparse and self.use_sparse_c8_inderex:
+                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor, dsa_k_cache_tensor, dsa_k_scale_cache_tensor)
+                            elif self.use_sparse:
+                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor, dsa_k_cache_tensor)
+                            else:
+                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -2619,7 +2646,14 @@ class NPUModelRunner(GPUModelRunner):
                 # encounter OOM issue
                 if isinstance(kv_cache_spec, AttentionSpec):
                     raw_dsa_k_tensor = None
-                    if self.use_sparse:
+                    if self.use_sparse and self.use_sparse_c8_inderex:
+                        raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor, raw_dsa_k_scale_tensor = kv_cache_raw_tensors[  # type: ignore
+                            layer_name]
+                        assert raw_dsa_k_tensor is not None
+                        assert raw_dsa_k_scale_tensor is not None
+                        sum_page_size_bytes = raw_k_tensor.numel(
+                        ) + raw_v_tensor.numel() + raw_dsa_k_tensor.numel() + raw_dsa_k_scale_tensor.numel()    
+                    elif self.use_sparse:
                         raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor = kv_cache_raw_tensors[  # type: ignore
                             layer_name]
                         assert raw_dsa_k_tensor is not None
@@ -2679,14 +2713,31 @@ class NPUModelRunner(GPUModelRunner):
                         k_cache = maybe_trans_nz(k_cache)
                         v_cache = maybe_trans_nz(v_cache)
                     if self.use_sparse and raw_dsa_k_tensor is not None:
+                        current_soc_type = get_ascend_device_type()
+                        if self.use_sparse_c8_inderex:
+                            c8_indexer_dtype = torch.float8_e4m3fn \
+                                if current_soc_type == AscendDeviceType.A5 else torch.int8
+                        else:
+                            c8_indexer_dtype = torch.int8
                         dsa_k_cache_shape = (num_blocks,
                                              kv_cache_spec.block_size, 1, 128)
-                        dsa_k_cache_size = (
-                            num_blocks
-                        ) * kv_cache_spec.block_size * 128 * dtype.itemsize
+                        # dsa_k_cache_size = (
+                        #     num_blocks
+                        # ) * kv_cache_spec.block_size * 128 * dtype.itemsize
+                        dsa_k_cache_size = num_blocks * kv_cache_spec.block_size * 128 * c8_indexer_dtype.itemsize
                         dsa_k_cache = raw_dsa_k_tensor[:dsa_k_cache_size].view(
-                            dtype).view(dsa_k_cache_shape)
-                        kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
+                            c8_indexer_dtype).view(dsa_k_cache_shape)
+                        if self.use_sparse_c8_inderex and raw_dsa_k_scale_tensor is not None:
+                            c8_scale_indexer_dtype = torch.float8_e4m3fn \
+                                if current_soc_type == AscendDeviceType.A5 else torch.float16
+                            dsa_k_scale_cache_shape = (num_blocks,
+                                                      kv_cache_spec.block_size, 1)
+                            dsa_k_scale_cache_size = num_blocks * kv_cache_spec.block_size * 1 * c8_scale_indexer_dtype.itemsize
+                            dsa_k_scale_cache = raw_dsa_k_scale_tensor[:dsa_k_scale_cache_size].view(
+                                c8_scale_indexer_dtype).view(dsa_k_scale_cache_shape)
+                            kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache, dsa_k_scale_cache)
+                        else:
+                            kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
                     else:
                         kv_caches[layer_name] = (k_cache, v_cache)
                 elif isinstance(kv_cache_spec, MambaSpec):
